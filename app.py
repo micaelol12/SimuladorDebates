@@ -12,6 +12,7 @@ st.set_page_config(page_title="Arena de Debates Parlamentares", page_icon="🏛�
 
 # CONSTANTE DE CONTROLE: Altere facilmente o limite de deputados aqui!
 MAX_DEPUTADOS = 4
+K_DOCUMENTOS = 5
 
 # Estilização Customizada CSS para os Cards e Abas Modernas
 st.markdown("""
@@ -192,7 +193,7 @@ class AgenteRepresentante:
     def obter_contexto_rag(self, termos_busca):
         q_emb = embeddings_model.embed_query(termos_busca)
         docs_recuperados = vector_store.similarity_search_by_vector(
-            embedding=q_emb, k=3, filter={"id_deputado": self.id_deputado}
+            embedding=q_emb, k=K_DOCUMENTOS, filter={"id_deputado": self.id_deputado}
         )
         return "".join([f"<discurso>\n{d.page_content}\n</discurso>\n\n" for d in docs_recuperados])
 
