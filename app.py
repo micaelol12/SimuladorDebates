@@ -13,8 +13,9 @@ st.set_page_config(page_title="Arena de Debates Parlamentares", page_icon="🏛�
 
 MAX_DEPUTADOS = 4
 K_DOCUMENTOS = 5
+MIN_K_DOCUMENTOS = 2
 
-# Estilização Customizada CSS
+# Estilização Customizada CSS para os Cards e Componentes Visuais
 st.markdown("""
     <style>
     .deputado-card {
@@ -148,6 +149,8 @@ if 'tela_atual' not in st.session_state:
     st.session_state.tela_atual = "config"
 if 'executar_debate' not in st.session_state:
     st.session_state.executar_debate = False
+if 'ids_filtrados_tema' not in st.session_state:
+    st.session_state.ids_filtrados_tema = None
 
 # ==============================================================================
 # PAINEL DE CONTROLE LATERAL (SIDEBAR)
@@ -177,7 +180,7 @@ st.sidebar.markdown("---")
 
 nova_pauta = st.sidebar.text_area(
     "📝 Proposta / Projeto de Lei:",
-    value="Proposta de Emenda à Constituição para redução da maioridade penal para 16 anos em casos de crimes hediondos.",
+    value="Proposta de Emenda à Constituição para redução da maioridade penal para 16 anos in casos de crimes hediondos.",
     height=100
 )
 
@@ -203,13 +206,14 @@ with col_btn_reset:
         st.session_state.selecionados = []
         st.session_state.tela_atual = "config"
         st.session_state.executar_debate = False
+        st.session_state.ids_filtrados_tema = None
         st.rerun()
 
 # ==============================================================================
 # LÓGICA AUXILIAR DOS AGENTES COM SUPORTE A STREAMING
 # ==============================================================================
 def agente_orquestrador(pauta: str):
-    prompt = f"Você é o Orquestrador Técnico da Câmara. Extraia termos de busca e palavras-chave separados por vírgula ideais para buscar discursos antigos pertinentes a esta pauta: {pauta}"
+    prompt = f"Você é o Orquestrador Técnico da Câmara. Extraia termos de busca e palavras-chave separados por vírgula ideais para buscar discursos antigos pertinentes a esta pauta: {pauta}. Não faça perguntas e não apresente dicas."
     return modelo_orquestrador.generate_content(prompt).text.strip()
 
 class AgenteRepresentante:
@@ -223,7 +227,6 @@ class AgenteRepresentante:
         docs_recuperados = vector_store.similarity_search_by_vector(
             embedding=q_emb, k=K_DOCUMENTOS, filter={"id_deputado": self.id_deputado}
         )
-        # Retorna o contexto textual e a contagem de documentos encontrados
         contexto_texto = "".join([f"<discurso>\n{d.page_content}\n</discurso>\n\n" for d in docs_recuperados])
         return contexto_texto, len(docs_recuperados)
 
@@ -257,7 +260,7 @@ st.markdown("---")
 
 # --- TELA 1: CONFIGURAÇÃO E CARDS ---
 if st.session_state.tela_atual == "config":
-    col_filtro_nome, col_filtro_partido = st.columns([2, 1])
+    col_filtro_nome, col_filtro_partido, col_filtro_tema = st.columns([2, 1, 1.5])
 
     with col_filtro_nome:
         busca_nome = st.text_input("🔍 Filtrar por nome:", "", placeholder="Digite o nome do parlamentar...")
@@ -266,11 +269,49 @@ if st.session_state.tela_atual == "config":
         lista_partidos = ["Todos"] + sorted(df_deputados['partido'].unique().tolist())
         partido_selecionado = st.selectbox("🎯 Filtrar por partido:", lista_partidos)
 
+    with col_filtro_tema:
+        st.markdown("<div style='height: 25px;'></div>", unsafe_allow_html=True)
+        
+        # Botões explícitos para acionar ou limpar a busca vetorial estática por tema
+        col_btn_aplicar, col_btn_limpar = st.columns(2)
+        with col_btn_aplicar:
+           if st.button("📚 Filtrar por Tema", type="secondary", use_container_width=True):
+            with st.spinner("🔍 Analisando histórico dos parlamentares..."):
+                termos_busca = agente_orquestrador(nova_pauta)
+                
+                # GRAVAÇÃO NA MEMÓRIA: Guardamos os termos exatos que o filtro usou
+                st.session_state.palavras_chave_persistentes = termos_busca
+                
+                q_emb = embeddings_model.embed_query(termos_busca)
+                
+                ids_com_discurso = set()
+                for id_dep in df_deputados['id'].unique():
+                    docs = vector_store.similarity_search_by_vector(
+                        embedding=q_emb, k=MIN_K_DOCUMENTOS, filter={"id_deputado": str(id_dep)}
+                    )
+                    if len(docs) >= MIN_K_DOCUMENTOS:
+                        ids_com_discurso.add(str(id_dep))
+                
+                st.session_state.ids_filtrados_tema = ids_com_discurso
+                st.rerun()
+        
+        with col_btn_limpar:
+            if st.button("❌ Limpar Tema", type="secondary", use_container_width=True, disabled=st.session_state.ids_filtrados_tema is None):
+                st.session_state.ids_filtrados_tema = None
+                st.session_state.palavras_chave_persistentes = None # <--- Limpa a memória técnica
+                st.rerun()
+    # Aplicação sequencial dos filtros no DataFrame de exibição
     df_filtrado = df_deputados
+    
     if busca_nome:
         df_filtrado = df_filtrado[df_filtrado['nome'].str.contains(busca_nome, case=False)]
     if partido_selecionado != "Todos":
         df_filtrado = df_filtrado[df_filtrado['partido'] == partido_selecionado]
+        
+    # Aplica o congelamento estático do filtro por tema se estiver na memória da sessão
+    if st.session_state.ids_filtrados_tema is not None:
+        st.sidebar.warning("📚 Filtro por tema ativo!")
+        df_filtrado = df_filtrado[df_filtrado['id'].isin(st.session_state.ids_filtrados_tema) | df_filtrado['id'].isin(st.session_state.selecionados)]
 
     st.markdown("### 📋 Parlamentares Disponíveis")
     if df_filtrado.empty:
@@ -314,7 +355,13 @@ else:
     
     if st.session_state.executar_debate:
         with st.spinner("🧠 Agente Orquestrador analisando conceitos da pauta..."):
-            palavras_chave = agente_orquestrador(nova_pauta)
+            if st.session_state.get('palavras_chave_persistentes'):
+                palavras_chave = st.session_state.palavras_chave_persistentes
+                st.caption("ℹ️ Reutilizando mapeamento temático otimizado pelo filtro de pauta.")
+            else:
+                with st.spinner("🧠 Agente Orquestrador analisando conceitos da pauta..."):
+                    palavras_chave = agente_orquestrador(nova_pauta)
+            
         st.markdown(f"ℹ️ **Tags RAG Extraídas:** `{palavras_chave}`")
         st.markdown("---")
         
@@ -330,16 +377,16 @@ else:
             with cols_discursos[i]:
                 st.chat_message("user", avatar=meta['foto']).markdown(f"**{meta['nome']} ({meta['partido']})**")
                 
-                # Instancia o agente e executa a busca vetorial (RAG)
                 agente = AgenteRepresentante(meta['id'], meta['nome'], meta['partido'])
                 contexto_recuperado, total_docs = agente.obter_contexto_rag(palavras_chave)
                 
-                # PONTO 2: Validação de fidelidade do contexto histórico recuperado
-                if total_docs < 2:
-                    st.warning("⚠️ Histórico escasso neste tema. Atuando por diretriz partidária.")
+                if total_docs == 0:
+                    st.warning("⚠️ Sem histórico localizado para este parlamentar. Atuando por diretriz partidária.")
+                elif total_docs < MIN_K_DOCUMENTOS:
+                    st.caption(f"✨ Histórico real parcial integrado ({total_docs} discursos encontrados).")
                 else:
-                    st.caption("✨ Histórico real integrado com sucesso.")
-                
+                    st.caption(f"✨ Histórico real completo integrado com sucesso ({total_docs} discursos encontrados).")
+                    
                 caixa_texto_dinamica = st.empty()
                 caixa_sentimento = st.empty()
                 
@@ -351,7 +398,6 @@ else:
                         texto_acumulado += chunk.text
                         caixa_texto_dinamica.markdown(f"> {texto_acumulado}")
                 
-                # Avaliação de Sentimento
                 with st.spinner("📊 Analisando tom político..."):
                     bg_color, text_color, rotulo_interno = obter_cor_politica(texto_acumulado)
                 
@@ -364,11 +410,9 @@ else:
                 dict_discursos_finais[f"{meta['nome']} ({meta['partido']})"] = texto_acumulado
                 dict_sentimentos_finais[f"{meta['nome']} ({meta['partido']})"] = rotulo_interno
 
-        # PONTO 4: Geração do Gráfico de Equilíbrio de Forças da Mesa
         st.markdown("---")
         st.subheader("📊 Balanço Analítico do Plenário")
         
-        # Estrutura dados para exibição do gráfico nativo
         contagem_tons = {"Altamente Opositor": 0, "Crítico": 0, "Neutro / Moderado": 0, "Favorável": 0, "Altamente Defensor": 0}
         for tom in dict_sentimentos_finais.values():
             if tom in contagem_tons:
@@ -377,7 +421,6 @@ else:
         df_grafico = pd.DataFrame(list(contagem_tons.items()), columns=["Postura Política", "Quantidade de Deputados"])
         st.bar_chart(df_grafico, x="Postura Política", y="Quantidade de Deputados", color="#3b82f6")
         
-        # Relatório de Mediação
         st.markdown("---")
         st.subheader("⚖️ Relatório de Mediação (Enriquecido com IA)")
         
