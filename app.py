@@ -4,7 +4,7 @@ import json
 import google.generativeai as genai
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS as LC_FAISS
-from transformers import pipeline  # <--- Nova dependência para o Sentiment Analysis
+from transformers import pipeline
 
 # ==============================================================================
 # CONFIGURAÇÕES DE UI/UX E CONSTANTES DE CONTROLE
@@ -105,7 +105,6 @@ def carregar_dados_e_modelos():
     df_deputados = pd.DataFrame(lista_deputados).drop_duplicates(subset=['id'])
     return vector_store, embeddings_model, df_deputados
 
-# Cache para o modelo de análise de sentimento (evita recarregar a cada clique)
 @st.cache_resource
 def carregar_analisador_sentimento():
     return pipeline("sentiment-analysis", model="nlptown/bert-base-multilingual-uncased-sentiment")
@@ -118,26 +117,25 @@ except Exception as e:
     st.stop()
 
 # ==============================================================================
-# FUNÇÃO AUXILIAR DE TRADUÇÃO DE SENTIMENTO
+# FUNÇÃO AUXILIAR DE MAPEAMENTO DE COR DO SENTIMENTO
 # ==============================================================================
 def obter_cor_politica(texto: str):
     """Mapeia as estrelas do BERT (1-5) diretamente para uma cor (vermelho a verde)."""
     try:
-        resultado = analisador_sentimento(texto[:512])[0]  # Trunca para evitar estouro de tokens do BERT
-        label = resultado['label']  # Retorna '1 star', '2 stars', etc.
+        resultado = analisador_sentimento(texto[:512])[0]
+        label = resultado['label']
         estrelas = int(label.split()[0])
         
-        # Mapeamento direto: Vermelho (Opositor) -> Laranja -> Cinza -> Verde Claro -> Verde Escuro (Defensor)
         if estrelas == 1:
-            return "#fee2e2", "#991b1b", "Altamente Opositor"  # Vermelho
+            return "#fee2e2", "#991b1b", "Altamente Opositor"
         elif estrelas == 2:
-            return "#ffedd5", "#c2410c", "Crítico"             # Laranja
+            return "#ffedd5", "#c2410c", "Crítico"
         elif estrelas == 3:
-            return "#f1f5f9", "#475569", "Neutro"              # Cinza/Moderado
+            return "#f1f5f9", "#475569", "Neutro / Moderado"
         elif estrelas == 4:
-            return "#ecfdf5", "#047857", "Favorável"           # Verde Claro
+            return "#ecfdf5", "#047857", "Favorável"
         else:
-            return "#dcfce7", "#166534", "Altamente Defensor"  # Verde Escuro
+            return "#dcfce7", "#166534", "Altamente Defensor"
     except Exception:
         return "#f1f5f9", "#475569", "Não Analisado"
 
@@ -225,7 +223,9 @@ class AgenteRepresentante:
         docs_recuperados = vector_store.similarity_search_by_vector(
             embedding=q_emb, k=K_DOCUMENTOS, filter={"id_deputado": self.id_deputado}
         )
-        return "".join([f"<discurso>\n{d.page_content}\n</discurso>\n\n" for d in docs_recuperados])
+        # Retorna o contexto textual e a contagem de documentos encontrados
+        contexto_texto = "".join([f"<discurso>\n{d.page_content}\n</discurso>\n\n" for d in docs_recuperados])
+        return contexto_texto, len(docs_recuperados)
 
     def responder_a_pauta_stream(self, pauta, contexto):
         prompt_persona = f"""
@@ -307,7 +307,7 @@ if st.session_state.tela_atual == "config":
                         st.session_state.selecionados.append(id_dep)
                         st.rerun()
 
-# --- TELA 2: PLENÁRIA COM STREAMING E SENTIMENTO ---
+# --- TELA 2: PLENÁRIA COM STREAMING, ABSTENÇÃO E GRÁFICO ---
 else:
     st.subheader("📋 Pauta em Julgamento")
     st.info(f"_{nova_pauta}_")
@@ -322,7 +322,7 @@ else:
         
         cols_discursos = st.columns(len(st.session_state.selecionados))
         dict_discursos_finais = {}
-        dict_sentimentos_finais = {}  # Guardará os dados estruturados de sentimento
+        dict_sentimentos_finais = {}
         
         for i, id_dep in enumerate(st.session_state.selecionados):
             meta = df_deputados[df_deputados['id'] == id_dep].iloc[0]
@@ -330,13 +330,18 @@ else:
             with cols_discursos[i]:
                 st.chat_message("user", avatar=meta['foto']).markdown(f"**{meta['nome']} ({meta['partido']})**")
                 
-                caixa_texto_dinamica = st.empty()
-                
-                # Placeholder para o card visual de sentimento aparecer logo abaixo do texto
-                caixa_sentimento = st.empty()
-                
+                # Instancia o agente e executa a busca vetorial (RAG)
                 agente = AgenteRepresentante(meta['id'], meta['nome'], meta['partido'])
-                contexto_recuperado = agente.obter_contexto_rag(palavras_chave)
+                contexto_recuperado, total_docs = agente.obter_contexto_rag(palavras_chave)
+                
+                # PONTO 2: Validação de fidelidade do contexto histórico recuperado
+                if total_docs < 2:
+                    st.warning("⚠️ Histórico escasso neste tema. Atuando por diretriz partidária.")
+                else:
+                    st.caption("✨ Histórico real integrado com sucesso.")
+                
+                caixa_texto_dinamica = st.empty()
+                caixa_sentimento = st.empty()
                 
                 resposta_stream = agente.responder_a_pauta_stream(nova_pauta, contexto_recuperado)
                 
@@ -346,33 +351,44 @@ else:
                         texto_acumulado += chunk.text
                         caixa_texto_dinamica.markdown(f"> {texto_acumulado}")
                 
-             # FIM DO STREAMING: Dispara a avaliação do tom político
-            with st.spinner("📊 Analisando tom político..."):
-                bg_color, text_color, rotulo_interno = obter_cor_politica(texto_acumulado)
+                # Avaliação de Sentimento
+                with st.spinner("📊 Analisando tom político..."):
+                    bg_color, text_color, rotulo_interno = obter_cor_politica(texto_acumulado)
+                
+                caixa_sentimento.markdown(f"""
+                    <div class="sentiment-box" style="background-color: {bg_color}; color: {text_color}; margin-top: 15px; border-left: 5px solid {text_color};">
+                        {rotulo_interno.upper()}
+                    </div>
+                """, unsafe_allow_html=True)
+                
+                dict_discursos_finais[f"{meta['nome']} ({meta['partido']})"] = texto_acumulado
+                dict_sentimentos_finais[f"{meta['nome']} ({meta['partido']})"] = rotulo_interno
 
-            # Exibe apenas uma barra colorida minimalista com o rótulo essencial
-            caixa_sentimento.markdown(f"""
-                <div class="sentiment-box" style="background-color: {bg_color}; color: {text_color}; margin-top: 15px; border-left: 5px solid {text_color};">
-                    {rotulo_interno.upper()}
-                </div>
-            """, unsafe_allow_html=True)
-
-            # Mantém a alimentação de dados rica para o Mediador saber o que a cor significa
-            dict_discursos_finais[f"{meta['nome']} ({meta['partido']})"] = texto_acumulado
-            dict_sentimentos_finais[f"{meta['nome']} ({meta['partido']})"] = rotulo_interno
-
+        # PONTO 4: Geração do Gráfico de Equilíbrio de Forças da Mesa
+        st.markdown("---")
+        st.subheader("📊 Balanço Analítico do Plenário")
+        
+        # Estrutura dados para exibição do gráfico nativo
+        contagem_tons = {"Altamente Opositor": 0, "Crítico": 0, "Neutro / Moderado": 0, "Favorável": 0, "Altamente Defensor": 0}
+        for tom in dict_sentimentos_finais.values():
+            if tom in contagem_tons:
+                contagem_tons[tom] += 1
+                
+        df_grafico = pd.DataFrame(list(contagem_tons.items()), columns=["Postura Política", "Quantidade de Deputados"])
+        st.bar_chart(df_grafico, x="Postura Política", y="Quantidade de Deputados", color="#3b82f6")
+        
+        # Relatório de Mediação
         st.markdown("---")
         st.subheader("⚖️ Relatório de Mediação (Enriquecido com IA)")
         
         caixa_mediador_dinamica = st.empty()
         
-        # Constrói o histórico injetando os sentimentos detectados para guiar melhor o mediador
         historico_mediador = ""
         for dep, txt in dict_discursos_finais.items():
             tom_detectado = dict_sentimentos_finais.get(dep, "Não detectado")
             historico_mediador += f"📌 [Pronunciamento de {dep} - Tom Político: {tom_detectado}]:\n{txt}\n\n"
             
-        prompt_med = f"Você é o Mediador da Câmara. Avalie o debate gerado sobre a pauta '{nova_pauta}'. Leve em consideração o tom político e nível de agressividade/conciliação detectado em cada discurso. Elabore um relatório contendo: 1) Pontos de convergência, 2) Conflitos ideológicos e 3) Clima Político geral.\n\nDebate:\n{historico_mediador}"
+        prompt_med = f"Você é o Mediador da Câmara. Avalie o debate gerado sobre a pauta '{nova_pauta}'. Leve em consideração o tom político detectado em cada discurso. Elabore um relatório contendo: 1) Pontos de convergência, 2) Conflitos ideológicos e 3) Clima Político geral.\n\nDebate:\n{historico_mediador}"
         
         mediador_stream = modelo_mediador.generate_content(prompt_med, stream=True)
         texto_med_acumulado = ""
