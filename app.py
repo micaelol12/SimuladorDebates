@@ -4,17 +4,17 @@ import json
 import google.generativeai as genai
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS as LC_FAISS
+from transformers import pipeline  # <--- Nova dependência para o Sentiment Analysis
 
 # ==============================================================================
 # CONFIGURAÇÕES DE UI/UX E CONSTANTES DE CONTROLE
 # ==============================================================================
 st.set_page_config(page_title="Arena de Debates Parlamentares", page_icon="🏛️", layout="wide")
 
-# CONSTANTE DE CONTROLE: Altere facilmente o limite de deputados aqui!
 MAX_DEPUTADOS = 4
 K_DOCUMENTOS = 5
 
-# Estilização Customizada CSS para os Cards e Abas Modernas
+# Estilização Customizada CSS
 st.markdown("""
     <style>
     .deputado-card {
@@ -60,6 +60,13 @@ st.markdown("""
         margin-left: 4px;
         display: inline-block;
     }
+    .sentiment-box {
+        padding: 10px;
+        border-radius: 8px;
+        margin-top: 10px;
+        font-weight: bold;
+        text-align: center;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -98,11 +105,41 @@ def carregar_dados_e_modelos():
     df_deputados = pd.DataFrame(lista_deputados).drop_duplicates(subset=['id'])
     return vector_store, embeddings_model, df_deputados
 
+# Cache para o modelo de análise de sentimento (evita recarregar a cada clique)
+@st.cache_resource
+def carregar_analisador_sentimento():
+    return pipeline("sentiment-analysis", model="nlptown/bert-base-multilingual-uncased-sentiment")
+
 try:
     vector_store, embeddings_model, df_deputados = carregar_dados_e_modelos()
+    analisador_sentimento = carregar_analisador_sentimento()
 except Exception as e:
-    st.error(f"Erro ao inicializar arquivos locais. Detalhes: {e}")
+    st.error(f"Erro ao inicializar arquivos ou modelos locais. Detalhes: {e}")
     st.stop()
+
+# ==============================================================================
+# FUNÇÃO AUXILIAR DE TRADUÇÃO DE SENTIMENTO
+# ==============================================================================
+def obter_cor_politica(texto: str):
+    """Mapeia as estrelas do BERT (1-5) diretamente para uma cor (vermelho a verde)."""
+    try:
+        resultado = analisador_sentimento(texto[:512])[0]  # Trunca para evitar estouro de tokens do BERT
+        label = resultado['label']  # Retorna '1 star', '2 stars', etc.
+        estrelas = int(label.split()[0])
+        
+        # Mapeamento direto: Vermelho (Opositor) -> Laranja -> Cinza -> Verde Claro -> Verde Escuro (Defensor)
+        if estrelas == 1:
+            return "#fee2e2", "#991b1b", "Altamente Opositor"  # Vermelho
+        elif estrelas == 2:
+            return "#ffedd5", "#c2410c", "Crítico"             # Laranja
+        elif estrelas == 3:
+            return "#f1f5f9", "#475569", "Neutro"              # Cinza/Moderado
+        elif estrelas == 4:
+            return "#ecfdf5", "#047857", "Favorável"           # Verde Claro
+        else:
+            return "#dcfce7", "#166534", "Altamente Defensor"  # Verde Escuro
+    except Exception:
+        return "#f1f5f9", "#475569", "Não Analisado"
 
 # ==============================================================================
 # INICIALIZAÇÃO DOS ESTADOS DA SESSÃO (SESSION STATE)
@@ -110,7 +147,7 @@ except Exception as e:
 if 'selecionados' not in st.session_state:
     st.session_state.selecionados = []
 if 'tela_atual' not in st.session_state:
-    st.session_state.tela_atual = "config"  # "config" ou "plenaria"
+    st.session_state.tela_atual = "config"
 if 'executar_debate' not in st.session_state:
     st.session_state.executar_debate = False
 
@@ -125,10 +162,8 @@ if not api_key:
     st.stop()
 
 genai.configure(api_key=api_key)
-
 st.sidebar.markdown("---")
 
-# Seleção de modelos para cada Agente
 st.sidebar.markdown("### 🤖 Configuração dos Modelos IA")
 modelos_disponiveis = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.1-flash-lite", "gemini-3.5-flash"]
 
@@ -142,14 +177,12 @@ modelo_mediador     = genai.GenerativeModel(modelo_med_nome)
 
 st.sidebar.markdown("---")
 
-# Input da Pauta
 nova_pauta = st.sidebar.text_area(
     "📝 Proposta / Projeto de Lei:",
     value="Proposta de Emenda à Constituição para redução da maioridade penal para 16 anos em casos de crimes hediondos.",
     height=100
 )
 
-# Monitor de selecionados na lateral
 st.sidebar.markdown(f"### 👥 Mesa do Debate ({len(st.session_state.selecionados)} de {MAX_DEPUTADOS})")
 if st.session_state.selecionados:
     for id_sel in st.session_state.selecionados:
@@ -159,8 +192,6 @@ else:
     st.sidebar.info("Nenhum deputado selecionado.")
 
 st.sidebar.markdown("---")
-
-# Botões de Ação na barra lateral
 col_btn_iniciar, col_btn_reset = st.sidebar.columns(2)
 
 with col_btn_iniciar:
@@ -175,7 +206,6 @@ with col_btn_reset:
         st.session_state.tela_atual = "config"
         st.session_state.executar_debate = False
         st.rerun()
-
 
 # ==============================================================================
 # LÓGICA AUXILIAR DOS AGENTES COM SUPORTE A STREAMING
@@ -206,16 +236,13 @@ class AgenteRepresentante:
         Histórico Real Recuperado: 
         {contexto if contexto else "Nenhum histórico específico encontrado."}
         """
-        # Ativa o stream=True para responder letra por letra na tela
         return modelo_persona.generate_content(prompt_persona, stream=True)
 
-
 # ==============================================================================
-# CORPO PRINCIPAL E ALTERNÂNCIA DE TELAS DINÂMICAS (UX REAL-TIME)
+# CORPO PRINCIPAL E ALTERNÂNCIA DE TELAS DINÂMICAS
 # ==============================================================================
 st.title("🏛️ Arena de Debates Parlamentares Inteligente")
 
-# Abas falsas de navegação usando botões superiores (Garante troca instantânea)
 col_tab1, col_tab2 = st.columns(2)
 with col_tab1:
     if st.button("👥 1. Mesa e Configuração", use_container_width=True, type="primary" if st.session_state.tela_atual == "config" else "secondary"):
@@ -280,60 +307,73 @@ if st.session_state.tela_atual == "config":
                         st.session_state.selecionados.append(id_dep)
                         st.rerun()
 
-# --- TELA 2: PLENÁRIA COM STREAMING PARALELO ---
+# --- TELA 2: PLENÁRIA COM STREAMING E SENTIMENTO ---
 else:
     st.subheader("📋 Pauta em Julgamento")
     st.info(f"_{nova_pauta}_")
     
-    # Se o botão de iniciar foi disparado, executa o streaming ao vivo na tela
     if st.session_state.executar_debate:
-        
         with st.spinner("🧠 Agente Orquestrador analisando conceitos da pauta..."):
             palavras_chave = agente_orquestrador(nova_pauta)
         st.markdown(f"ℹ️ **Tags RAG Extraídas:** `{palavras_chave}`")
         st.markdown("---")
         
-        st.subheader("🎤 Pronunciamentos Oficiais (Em tempo real)")
+        st.subheader("🎤 Pronunciamentos Oficiais e Postura Política")
         
-        # Cria colunas lado a lado para renderizar o streaming dos deputados simultaneamente
         cols_discursos = st.columns(len(st.session_state.selecionados))
         dict_discursos_finais = {}
+        dict_sentimentos_finais = {}  # Guardará os dados estruturados de sentimento
         
-        # Loop para processar e exibir cada deputado escrevendo na tela aos poucos
         for i, id_dep in enumerate(st.session_state.selecionados):
             meta = df_deputados[df_deputados['id'] == id_dep].iloc[0]
             
             with cols_discursos[i]:
-                # Desenha a foto e o cabeçalho do chat fixo
                 st.chat_message("user", avatar=meta['foto']).markdown(f"**{meta['nome']} ({meta['partido']})**")
                 
-                # Cria um container vazio (placeholder) onde o texto vai pingar dinamicamente
                 caixa_texto_dinamica = st.empty()
+                
+                # Placeholder para o card visual de sentimento aparecer logo abaixo do texto
+                caixa_sentimento = st.empty()
                 
                 agente = AgenteRepresentante(meta['id'], meta['nome'], meta['partido'])
                 contexto_recuperado = agente.obter_contexto_rag(palavras_chave)
                 
-                # Invoca a resposta em modo streaming
                 resposta_stream = agente.responder_a_pauta_stream(nova_pauta, contexto_recuperado)
                 
                 texto_acumulado = ""
                 for chunk in resposta_stream:
                     if chunk.text:
                         texto_acumulado += chunk.text
-                        # Atualiza a tela a cada palavra nova recebida do Gemini
                         caixa_texto_dinamica.markdown(f"> {texto_acumulado}")
                 
-                # Guarda o texto completo final para passar ao mediador
-                dict_discursos_finais[f"{meta['nome']} ({meta['partido']})"] = texto_acumulado
+             # FIM DO STREAMING: Dispara a avaliação do tom político
+            with st.spinner("📊 Analisando tom político..."):
+                bg_color, text_color, rotulo_interno = obter_cor_politica(texto_acumulado)
+
+            # Exibe apenas uma barra colorida minimalista com o rótulo essencial
+            caixa_sentimento.markdown(f"""
+                <div class="sentiment-box" style="background-color: {bg_color}; color: {text_color}; margin-top: 15px; border-left: 5px solid {text_color};">
+                    {rotulo_interno.upper()}
+                </div>
+            """, unsafe_allow_html=True)
+
+            # Mantém a alimentação de dados rica para o Mediador saber o que a cor significa
+            dict_discursos_finais[f"{meta['nome']} ({meta['partido']})"] = texto_acumulado
+            dict_sentimentos_finais[f"{meta['nome']} ({meta['partido']})"] = rotulo_interno
 
         st.markdown("---")
-        st.subheader("⚖️ Relatório de Mediação e Clima Político")
+        st.subheader("⚖️ Relatório de Mediação (Enriquecido com IA)")
         
         caixa_mediador_dinamica = st.empty()
-        historico_mediador = "".join([f"📌 [Pronunciamento de {dep}]:\n{txt}\n\n" for dep, txt in dict_discursos_finais.items()])
-        prompt_med = f"Você é o Mediador da Câmara. Avalie o debate gerado sobre a pauta '{nova_pauta}'. Elabore um relatório contendo: 1) Pontos de convergência, 2) Conflitos ideológicos e 3) Clima Político geral.\n\nDebate:\n{historico_mediador}"
         
-        # Streaming para a resposta do mediador final
+        # Constrói o histórico injetando os sentimentos detectados para guiar melhor o mediador
+        historico_mediador = ""
+        for dep, txt in dict_discursos_finais.items():
+            tom_detectado = dict_sentimentos_finais.get(dep, "Não detectado")
+            historico_mediador += f"📌 [Pronunciamento de {dep} - Tom Político: {tom_detectado}]:\n{txt}\n\n"
+            
+        prompt_med = f"Você é o Mediador da Câmara. Avalie o debate gerado sobre a pauta '{nova_pauta}'. Leve em consideração o tom político e nível de agressividade/conciliação detectado em cada discurso. Elabore um relatório contendo: 1) Pontos de convergência, 2) Conflitos ideológicos e 3) Clima Político geral.\n\nDebate:\n{historico_mediador}"
+        
         mediador_stream = modelo_mediador.generate_content(prompt_med, stream=True)
         texto_med_acumulado = ""
         for chunk in mediador_stream:
@@ -341,7 +381,6 @@ else:
                 texto_med_acumulado += chunk.text
                 caixa_mediador_dinamica.info(texto_med_acumulado)
         
-        # Desliga a flag de execução para o debate ficar estático na tela caso mude de filtro
         st.session_state.executar_debate = False
     else:
         st.warning("💤 Sessão finalizada. Caso queira rodar uma nova simulação, retorne para a aba de Configuração.")
